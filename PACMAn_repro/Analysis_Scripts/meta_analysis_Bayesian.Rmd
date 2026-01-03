@@ -1,0 +1,352 @@
+---
+Organizer:Serene Ren
+Author: Jordan Garrett
+title: "PACMAn Meta-Analysis: Bayesian Hiearchical Modeling"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(metafor)
+library(tidyverse)
+library(dplyr)
+library(esc)
+library(brms)
+library(bayestestR)
+library(gt)
+library(reshape2)
+library(emmeans)
+library(ggridges)
+```
+```{r}
+cur <- getwd()
+setwd(cur)
+
+#import csv
+effectSizes.df <- readRDS("../Data/study_effects_trimmed_filled.rds")
+head(effectSizes.df)
+
+# 列名清单
+cat("Columns:\n")
+print(names(effectSizes.df))
+```
+### ---- Bayesian hierarchical modeling ----
+
+```{r}
+## ---- Setting up Priors ----
+# Intercept represents mu, while sd represents tau
+
+overall_effect.priors <- c(prior(normal(0,1), class=Intercept),
+                           prior(cauchy(0,0.5), class=sd))
+
+
+betaWeight_prior <- c(prior(normal(0,1), class='b'))
+
+priors <- c(overall_effect.priors,betaWeight_prior)
+
+hdi_width = .89
+```
+
+```{r}
+# g 每篇文献里每条效应量，g_se 对应的标准误，1 只估计一个总平均数，不同文章有不同的效应量，文章里有多条效应量
+# “只含截距”： 固定效应部分不写任何协变量，只有总均值 μ。
+# “每个研究一个随机截距”：(1 | studyID)，模型只有“研究间”这一层随机效应，“两层 meta 分析”
+# (1 | studyID/esID)：brms 会展开成(1 | studyID) + (1 | studyID:esID) 【学生-班级-学校】
+  # the 1st level of the model can be each individual effect. 
+  # The 2nd level could indicate each effect is clustered within studies. 
+  # the 3rd level represents the pooling of effect sizes across studies.
+
+# 模型保存目录：当前文件夹里的 models 子文件夹
+modelDir <- file.path(cur, "models")
+dir.create(modelDir, showWarnings = FALSE) 
+
+overall_model <- brm(g|se(g_se) ~ 1 + (1|Article.ID/es.ids),
+                     data=effectSizes.df,
+                     prior=overall_effect.priors,
+                     # iter = 12000, chains = 4, cores=4, warmup=2000,
+                     iter = 1000, chains = 2, cores=2, warmup=200,
+                     # control=list(max_treedepth=12),
+                     control=list(),
+                     save_pars = save_pars(all=T), seed = 123,
+                     file=paste(modelDir,'overall_random',sep='/'),
+                     file_refit = 'on_change')
+```
+
+```{r}
+# Group-Level effects: sd(Intercept) represents between-study heterogeneity, or tau
+# Population-Level effects: Intercept represents the overall pooled effect of the analysis
+summary(overall_model)
+```
+### ---- Subgroup Analyses ----
+
+```{r}
+## ---- Exercise Intensity ----
+
+# Influence of exercise Intensity
+print('Exercise Intensity\n')
+#默认情况下，R 会把分组变量里按字母排序的第一组当成“参考组”，其他组都跟它比；
+# 这样参考组的后验标准误容易变小，显得“更稳”，别的组吃亏。
+# contr.equalprior 让 brms 改用“等先验”对比（也叫“等权重和”对比）：
+# 所有组一起估计，没有谁一定是 0，各组的不确定性更公平，事后看差异也更直观。
+contrasts(effectSizes.df$Ex.ACSM.2) <- contr.equalprior
+
+exIntensity.model <- update(overall_model, formula. = ~ . + Ex.ACSM.2, #把运动强度扔进去当固定效应。
+                            newdata = effectSizes.df, #数据换成完整数据集 effectSizes.df（确保新变量在里面
+                            prior = priors, 
+                            # iter = 12000, chains = 4, warmup=2000,
+                            iter = 1000, chains = 2, warmup=200,
+                            cores = 4,
+                            save_pars=save_pars(all=T), seed=123, 
+                            control=list(max_treedepth=15),
+                            file=paste(modelDir,'subgroup_intensity', sep='/'),
+                            file_refit = 'on_change')
+
+```
+```{r}
+summary(exIntensity.model)
+```
+```{r}
+effectSizes.df$Ex.ACSM.2
+```
+
+```{r}
+## ---- Exercise Duration ----
+print('Exercise Duration\n')
+contrasts(effectSizes.df$Duration.3) <- contr.equalprior
+
+duration_model <- update(overall_model, formula. = ~ . + Duration.3,
+                         newdata=effectSizes.df,
+                         prior= c(overall_effect.priors, betaWeight_prior),
+                         # iter = 12000, chains = 4, warmup=2000, cores = 4,
+                         iter = 1000, chains = 2, warmup=200,
+                         save_pars = save_pars(all=T), seed = 123,
+                         control = list(max_treedepth=15),
+                         file=paste(modelDir,'subgroup_duration',sep='/'),
+                         file_refit = 'on_change')
+```
+
+```{r}
+summary(duration_model)
+```
+### ---- Comparing Models ----
+
+```{r}
+# ---- Load models that have all been trained on same data points
+overall_model <- readRDS('../Analysis_Scripts/models/overall_random.rds')
+inten_model <- readRDS('../Analysis_Scripts/models/subgroup_intensity.rds')
+duration_model <- readRDS('../Analysis_Scripts/models/subgroup_duration.rds')
+```
+
+
+```{r}
+model_compare_bfs <- bayesfactor_models(inten_model, duration_model)
+```
+
+```{r}
+
+inclusion_bfs <- bayesfactor_inclusion(model_compare_bfs, 
+                                       match=T)
+
+model_compare_bfs$BF <- exp(model_compare_bfs$log_BF)
+inclusion_bfs$BF <- exp(inclusion_bfs$log_BF)
+
+saveRDS(model_compare_bfs, 'all_model_comparison_bfs.rds')
+saveRDS(inclusion_bfs, 'all_model_inclusionBFs.rds')
+```
+
+### ---- Sensitivity Analyses ----
+
+```{r}
+# --- Setting Up Directories ---
+
+parentDir <- 'F:/Downloads/PACMAn-main/PACMAn-main/Analysis_Scripts'
+modelDir <- file.path(parentDir,'Models')
+plotDir <- file.path(parentDir,'Figures')
+
+setwd(modelDir)
+```
+```{r}
+# --- Load Models ---
+
+overall_model <- readRDS('../Analysis_Scripts/models/overall_random.rds')
+#exIntensity.model <- readRDS('subgroup_intensity.rds')
+#duration_model <- readRDS('subgroup_duration.rds')
+```
+
+```{r}
+# --- t-Distribution likelihood ---
+#把原来的“正态分布”假设改成厚尾 t 分布，相当于给每条效应量再加一个“自由度”参数 ν（nu），用来吸收极端离群值。
+t_priors <- c(prior(normal(0,1), class=Intercept),
+              prior(cauchy(0,0.5), class=sd),
+              prior(exponential(one_over_twentynine), class=nu))
+
+#把 likelihood 从 gaussian 换成 Student-t，尾巴比正态肥，遇到离谱的研究不会被它一把拽跑。
+overall_model.t <- update(overall_model, family=student,
+                          prior=t_priors, 
+                          # iter = 12000, chains = 4, warmup=2000, cores=4,
+                          iter = 1000, chains = 2, cores=2, warmup=200,
+                          stanvars = stanvar(1/29, name='one_over_twentynine'),
+                          save_pars=save_pars(all=T), seed=123,
+                          file=paste(modelDir,'overall_t', sep='/'),
+                          file_refit = 'on_change')
+```
+```{r}
+# --- No effect exercise prior ---
+# 默认的“总效应”先验收紧一点,看看结论是不是被原来的宽先验带跑偏。
+ne_priors <- c(prior(normal(0,0.5), class=Intercept),
+               prior(cauchy(0,0.5), class=sd))
+
+overall_model.ne_prior <- update(overall_model, prior=ne_priors, 
+                                 # iter = 12000, chains = 4, warmup=2000, cores=4,
+                                 iter = 1000, chains = 2, cores=2, warmup=200,
+                                 save_pars=save_pars(all=T), seed=123,
+                                 file=paste(modelDir,'overall_ne', sep='/'),
+                                 file_refit = 'on_change')
+```
+
+```{r}
+# --- Positive effect prior ---
+# 给“总体效应”先验一个偏向正值的猜测，看看最后后验是不是还被数据拉回零附近
+pe_priors <- c(prior(normal(0.24,0.57), class=Intercept),
+                            prior(cauchy(0,0.5), class=sd))
+
+overall_model.pe_prior <- update(overall_model, prior=pe_priors, 
+                                 # iter = 12000, chains = 4, warmup=2000, cores=4,
+                                 iter = 1000, chains = 2, cores=2, warmup=200,
+                                 save_pars=save_pars(all=T), seed=123,
+                                 file=paste(modelDir,'overall_pe', sep='/'),
+                                 file_refit = 'on_change')
+```
+
+```{r}
+# --- Bayesfactor Comparisons ---
+#把 4 个模型一次性摆到一起，算 Bayes Factor（BF），看谁的“证据力”最强
+bf_compare = bayesfactor_models(overall_model.t, overall_model.ne_prior, overall_model.pe_prior,
+                               denominator=overall_model)
+bf_compare$BF = exp(bf_compare$log_BF)
+bf_compare$Model_Name = c('t', 'Null-Prior', 'Positive-Prior', 'Standard-Normal')
+saveRDS(bf_compare, 'sensitivity_analyses_BFs.RDS')
+```
+
+```{r}
+# --- Extract Posteriors ---
+overall_posts <- as_draws_df(overall_model, variable=c('^b','^sd'), regex=T)
+overall_posts.t <- as_draws_df(overall_model.t, variable=c('^b','^sd'), regex=T)
+overall_posts.ne <- as_draws_df(overall_model.ne_prior, variable=c('^b','^sd'), regex=T)
+overall_posts.pe <- as_draws_df(overall_model.pe_prior, variable=c('^b','^sd'), regex=T)
+
+
+names(overall_posts)[c(1:3)] <- names(overall_posts.t)[c(1:3)] <- 
+  names(overall_posts.ne)[c(1:3)] <- names(overall_posts.pe)[c(1:3)]  <- c('g','tau1','tau2')
+
+
+overall_posts$Model <- 1
+overall_posts.t$Model <- 2
+overall_posts.ne$Model <- 3
+overall_posts.pe$Model <- 4
+
+all_overall.posts <- rbind(overall_posts,overall_posts.t,overall_posts.ne, overall_posts.pe)
+
+all_overall.posts <- all_overall.posts %>% 
+  mutate(Model = factor(Model, labels=c('Initial','t-likelihood','no_effect', 'positive_effect')))
+
+
+```
+
+```{r}
+# ---- Plot Posteriors ----
+compare_mu.plot <- ggplot(all_overall.posts, aes(x=g, y=Model)) + 
+  geom_density_ridges(aes(color=Model),alpha=0.25, size=1) + 
+  stat_pointinterval(point_interval = mode_hdi, .width = 0.89, 
+                     size=5, point_size=2, shape=21, 
+                     mapping=aes(fill=Model, interval_colour=Model, interval_alpha=0.3),
+                     show.legend=F) +
+  labs(x = expression(paste("Hedge's ", italic(g))),
+       y = 'Density',
+       title=NULL) +
+  scale_color_discrete(name='Prior/Likelihood:', labels=c('Weakly\nInformed','TL','NE','PE')) + 
+  scale_fill_discrete(name='Prior/Likelihood:', labels=c('Weakly\nInformed','TL','NE','PE')) +
+  scale_y_discrete(labels=c('Weakly\nInformed', 'TL','NE','PE'))+
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size=11,hjust = 0.5),
+    axis.line.x = element_line(colour="black",size=.4),
+    axis.text = element_text(size=8.5,color='black'),
+    axis.title = element_text(size=9,color='black'),
+    legend.text = element_text(size=6),
+    legend.title = element_text(size=10),
+    legend.position = 'bottom'
+  )
+
+compare_mu.legend <- cowplot::get_legend(compare_mu.plot)
+compare_mu.legend.plot <- cowplot::ggdraw(compare_mu.legend)
+
+compare_mu.plot <- compare_mu.plot + theme(legend.position='none')
+
+
+ggsave('Sensitivity_compare_pooledEffect.jpg', plot=compare_mu.plot,
+       path=plotDir, units='in', width = 2.833, height=2.3319, bg='white')
+
+ggsave('compare_mu_plot.jpg', plot=compare_mu.legend.plot, path=plotDir,
+       units='in', width=4.17, height=1.6, bg='white')
+
+compare_tau1.plot <- ggplot(all_overall.posts, aes(x=tau1, y=Model)) + 
+  geom_density_ridges(aes(color=Model), alpha=0.25, size=1) + 
+  stat_pointinterval(point_interval = mode_hdi, .width = 0.89, 
+                     size=5, point_size=2, shape=21, 
+                     mapping=aes(fill=Model, interval_colour=Model, interval_alpha=0.3),
+                     show.legend=F) +
+  scale_color_discrete(name='Prior/Likelihood:', labels=c('Weakly\nInformed','TL','NE','PE')) + 
+  scale_fill_discrete(name='Prior/Likelihood:', labels=c('Weakly\nInformed','TL','NE','PE')) +
+  scale_y_discrete(labels=element_blank()) +
+  labs(x = expression({tau[Between]}),
+       y = element_blank(),
+       title=NULL) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size=11,hjust = 0.5),
+    axis.line.x = element_line(colour="black",size=.4),
+    axis.text = element_text(size=8.5,color='black'),
+    axis.title = element_text(size=9,color='black'),
+    legend.position = 'none'
+  )
+
+ggsave('Sensitivity_compare_tau1.jpg', plot=compare_tau1.plot,
+  path=plotDir, units='in', width = 2.833, height=2.3319, bg='white')
+
+compare_tau2.plot <- ggplot(all_overall.posts, aes(x=tau2, y=Model)) + 
+  geom_density_ridges(aes(color=Model), alpha=0.25, size=1) + 
+  stat_pointinterval(point_interval = mode_hdi, .width = 0.89, 
+                     size=5, point_size=2, shape=21, 
+                     mapping=aes(fill=Model, interval_colour=Model, interval_alpha=0.3),
+                     show.legend=F) +
+  scale_color_discrete(name='Prior/Likelihood:', labels=c('Weakly\nInformed','TL','NE','PE')) + 
+  scale_fill_discrete(name='Prior/Likelihood:', labels=c('Weakly\nInformed','TL','NE','PE')) +
+  scale_y_discrete(labels=element_blank())+
+  labs(x = expression({tau[Within]}),
+       y = element_blank(),
+       title=NULL) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size=11,hjust = 0.5),
+    axis.line.x = element_line(colour="black",size=.4),
+    axis.text = element_text(size=8.5,color='black'),
+    axis.title = element_text(size=9,color='black'),
+    legend.position = 'none'
+  )
+
+ggsave('Sensitivity_compare_tau2.jpg', plot=compare_tau2.plot,
+       path=plotDir, units='in', width = 2.833, height=2.3319, bg='white')
+
+```
+
+
+
+
+
+
+
+
